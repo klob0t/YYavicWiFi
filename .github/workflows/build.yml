@@ -29,7 +29,7 @@ jobs:
       - name: Build
         working-directory: Source
         env:
-          YY_VERSION: 0.7.3-id2
+          YY_VERSION: 0.7.30
         run: |
           zsh ./build-yyavic.sh release
 
@@ -41,5 +41,5 @@ jobs:
       - name: Upload kext
         uses: actions/upload-artifact@v4
         with:
-          name: YYavicWiFi-0.7.3-id2
+          name: YYavicWiFi-0.7.30-id2
           path: Source/build-release/YYavicWiFi.kext
