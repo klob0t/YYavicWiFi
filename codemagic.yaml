@@ -1,6 +1,6 @@
 # Codemagic build of the patched YYavicWiFi kext (same steps as build.yml).
 # Put this file in the fork's top folder (next to README.md), together with
-# yyavic-0.7.3-local-v5.patch. In Codemagic: add the repo, choose
+# yyavic-0.7.3-local-v6.patch. In Codemagic: add the repo, choose
 # "codemagic.yaml" as the configuration, then "Start new build" with the
 # workflow "Build patched YYavicWiFi". The zipped kext is under Artifacts.
 
@@ -12,13 +12,13 @@ workflows:
     environment:
       xcode: 16.4
       vars:
-        YY_VERSION: 0.7.31
+        YY_VERSION: 0.7.32
     scripts:
       - name: Apply local patch to the upstream commit
         script: |
           git fetch --unshallow || true
           git checkout 33c4a28 -- Source
-          git apply --verbose yyavic-0.7.3-local-v5.patch
+          git apply --verbose yyavic-0.7.3-local-v6.patch
 
       - name: Show toolchain
         script: |
@@ -34,7 +34,7 @@ workflows:
       - name: Zip the kext
         script: |
           cd Source/build-release
-          ditto -c -k --keepParent YYavicWiFi.kext YYavicWiFi-0.7.31.zip
+          ditto -c -k --keepParent YYavicWiFi.kext YYavicWiFi-0.7.32.zip
 
       - name: Show build logs on failure
         ignore_failure: true
@@ -42,5 +42,5 @@ workflows:
           for f in Source/build-release/*.log; do echo "=== $f"; tail -60 "$f"; done
 
     artifacts:
-      - Source/build-release/YYavicWiFi-0.7.31.zip
+      - Source/build-release/YYavicWiFi-0.7.32.zip
       - Source/build-release/*.log
