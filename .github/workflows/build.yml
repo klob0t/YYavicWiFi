@@ -1,7 +1,7 @@
 name: Build patched YYavicWiFi
 
 # Put this file in your fork at .github/workflows/build.yml and the patch
-# (yyavic-0.7.3-local-v4.patch) in the repository root. Then: Actions tab ->
+# (yyavic-0.7.3-local-v5.patch) in the repository root. Then: Actions tab ->
 # "Build patched YYavicWiFi" -> Run workflow. The kext is in the run's
 # Artifacts section when it finishes.
 
@@ -18,7 +18,7 @@ jobs:
         run: |
           git fetch --unshallow || true
           git checkout 33c4a28 -- Source
-          git apply --verbose yyavic-0.7.3-local-v4.patch
+          git apply --verbose yyavic-0.7.3-local-v5.patch
 
       - name: Show toolchain
         run: |
@@ -29,7 +29,7 @@ jobs:
       - name: Build
         working-directory: Source
         env:
-          YY_VERSION: 0.7.30
+          YY_VERSION: 0.7.31
         run: |
           zsh ./build-yyavic.sh release
 
@@ -41,5 +41,5 @@ jobs:
       - name: Upload kext
         uses: actions/upload-artifact@v4
         with:
-          name: YYavicWiFi-0.7.30-id2
+          name: YYavicWiFi-0.7.31-assoclog
           path: Source/build-release/YYavicWiFi.kext
