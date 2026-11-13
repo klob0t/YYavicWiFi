@@ -1,0 +1,275 @@
+diff --git a/Source/YYavicAirWiFiLayer/src/YYavicAirWiFiLayer.cpp b/Source/YYavicAirWiFiLayer/src/YYavicAirWiFiLayer.cpp
+index 6f2e6ac..97c640e 100644
+--- a/Source/YYavicAirWiFiLayer/src/YYavicAirWiFiLayer.cpp
++++ b/Source/YYavicAirWiFiLayer/src/YYavicAirWiFiLayer.cpp
+@@ -173,8 +173,29 @@ static IOPMPowerState gYYPowerStates[2] = {
+ OSDefineMetaClassAndStructors(YYavicAirWiFiLayerPCI, IOService)
+ 
+ #define YY_AUTOARM_MIN_S    20      /* auto-arm: not before 20 s after start */
++/* Fast start (local patch): first auto-arm check after 3 s, polls every
++ * 500 ms, controller published 1 s after arming. -yyavicslowarm restores
++ * the original 20 s / 2 s / 10 s timing (log-to-disk safety margin). */
++#define YY_FAST_FIRST_MS    3000
++#define YY_FAST_POLL_MS     500
++#define YY_FAST_ARM_MS      1000
++
+ static thread_call_t gYYAutoCall;
+ static void yy_autoarm_fire(thread_call_param_t p0, thread_call_param_t);
++static bool yy_slow_arm()
++{
++    int dummy = 0;
++    return PE_parse_boot_argn("-yyavicslowarm", &dummy, sizeof(dummy));
++}
++static void yy_autoarm_poll_later()
++{
++    uint64_t dl;
++    if (yy_slow_arm())
++        clock_interval_to_deadline(2, kSecondScale, &dl);
++    else
++        clock_interval_to_deadline(YY_FAST_POLL_MS, kMillisecondScale, &dl);
++    thread_call_enter_delayed(gYYAutoCall, dl);
++}
+ 
+ IOService *YYavicAirWiFiLayerPCI::probe(IOService *provider, SInt32 *score)
+ {
+@@ -239,10 +260,14 @@ bool YYavicAirWiFiLayerPCI::start(IOService *provider)
+     } else {
+         gYYAutoCall = thread_call_allocate(yy_autoarm_fire, this);
+         uint64_t dl;
+-        clock_interval_to_deadline(YY_AUTOARM_MIN_S, kSecondScale, &dl);
++        if (yy_slow_arm())
++            clock_interval_to_deadline(YY_AUTOARM_MIN_S, kSecondScale, &dl);
++        else
++            clock_interval_to_deadline(YY_FAST_FIRST_MS, kMillisecondScale, &dl);
+         if (gYYAutoCall != nullptr)
+             thread_call_enter_delayed(gYYAutoCall, dl);
+-        yy_trace("PCI: auto-arm in %u s once the radio is up\n", YY_AUTOARM_MIN_S);
++        yy_trace("PCI: auto-arm in %u ms once the radio is up\n",
++                 (unsigned)(yy_slow_arm() ? YY_AUTOARM_MIN_S * 1000 : YY_FAST_FIRST_MS));
+     }
+     return true;
+ }
+@@ -324,11 +349,15 @@ void YYavicAirWiFiLayerPCI::armNow(int mode, const char *by)
+     gYYArmed = true;
+     setProperty("yy-state", "arming");
+     setProperty("yy-armed-by", by);
+-    yy_trace("PCI: ARMED by %s; controller in 10 s\n", by);
++    yy_trace("PCI: ARMED by %s; controller in %u ms\n", by,
++             yy_slow_arm() ? 10000u : (unsigned)YY_FAST_ARM_MS);
+     if (gYYArmCall == nullptr)
+         gYYArmCall = thread_call_allocate(yy_arm_fire, this);
+     uint64_t deadline;
+-    clock_interval_to_deadline(10, kSecondScale, &deadline);
++    if (yy_slow_arm())
++        clock_interval_to_deadline(10, kSecondScale, &deadline);
++    else
++        clock_interval_to_deadline(YY_FAST_ARM_MS, kMillisecondScale, &deadline);
+     thread_call_enter_delayed(gYYArmCall, deadline);
+ }
+ 
+@@ -450,12 +479,11 @@ static void yy_autoarm_fire(thread_call_param_t p0, thread_call_param_t)
+         char why[96];
+         static uint32_t osWaits;
+         int ok = yy_os_layout_ok(why, sizeof(why));
+-        if (ok < 0 && osWaits++ < 150) {            /* wait up to ~5 min for it */
++        /* wait up to ~5 min for it (600 x 500 ms, or 150 x 2 s slow) */
++        if (ok < 0 && osWaits++ < (yy_slow_arm() ? 150u : 600u)) {
+             if (osWaits == 1)
+                 yy_trace("PCI: waiting for the OS build to be published\n");
+-            uint64_t dl;
+-            clock_interval_to_deadline(2, kSecondScale, &dl);
+-            thread_call_enter_delayed(gYYAutoCall, dl);
++            yy_autoarm_poll_later();
+             return;
+         }
+         if (ok != 1) {
+@@ -481,10 +509,8 @@ static void yy_autoarm_fire(thread_call_param_t p0, thread_call_param_t)
+         r->release();
+     }
+     if (!ready) {
+-        if (gYYAutoTries < YY_AUTOARM_TRIES) {
+-            uint64_t dl;
+-            clock_interval_to_deadline(2, kSecondScale, &dl);
+-            thread_call_enter_delayed(gYYAutoCall, dl);
++        if (gYYAutoTries < (yy_slow_arm() ? YY_AUTOARM_TRIES : YY_AUTOARM_TRIES * 4)) {
++            yy_autoarm_poll_later();
+         } else {
+             yy_trace("PCI: auto-arm gave up, radio not ready (abi %u)\n", abi);
+             pci->setProperty("yy-state", "auto-arm: radio not ready");
+diff --git a/Source/YYavicMtkWlan/YYavicMtkWlan/hal_mwx/MtkMwx.cpp b/Source/YYavicMtkWlan/YYavicMtkWlan/hal_mwx/MtkMwx.cpp
+index e9d5126..82ceace 100644
+--- a/Source/YYavicMtkWlan/YYavicMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/Source/YYavicMtkWlan/YYavicMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -641,8 +641,8 @@ mwx_yy_hw_addr(uint8_t *out)
+  * firmware gets in the channel domain and TX power commands, as Linux sends
+  * the regdomain's alpha2. 20 MHz channel numbers; the radio's scan is passive.
+  */
+-enum mwx_reg { MWX_REG_WORLD, MWX_REG_ETSI, MWX_REG_FCC, MWX_REG_JP, MWX_REG_CN };
+-static const char *const mwx_reg_names[] = { "world", "ETSI", "FCC", "JP", "CN" };
++enum mwx_reg { MWX_REG_WORLD, MWX_REG_ETSI, MWX_REG_FCC, MWX_REG_JP, MWX_REG_CN, MWX_REG_ID };
++static const char *const mwx_reg_names[] = { "world", "ETSI", "FCC", "JP", "CN", "ID" };
+ /* EU, EEA, CH, GB, TR: 2.4 GHz 1-13, 5 GHz 36-64 and 100-140 */
+ static const char mwx_reg_etsi[] =
+     "AT BE BG CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU LV MT "
+@@ -661,6 +661,8 @@ mwx_reg_of(const char *cc)
+ 		return MWX_REG_JP;		/* 1-13, 36-64, 100-140 */
+ 	if (cc[0] == 'C' && cc[1] == 'N')
+ 		return MWX_REG_CN;		/* 1-13, 36-64, 149-165 */
++	if (cc[0] == 'I' && cc[1] == 'D')
++		return MWX_REG_ID;		/* 1-13, 36-64, 149-161 (Indonesia) */
+ 	for (p = mwx_reg_etsi; p[0] != '\0' && p[1] != '\0'; p += 3) {
+ 		if (p[0] == cc[0] && p[1] == cc[1])
+ 			return MWX_REG_ETSI;
+@@ -686,6 +688,9 @@ mwx_reg_allowed(int reg, int is5, int ch)
+ 		return (ch >= 100 && ch <= 144) || (ch >= 149 && ch <= 165);
+ 	case MWX_REG_CN:
+ 		return ch >= 149 && ch <= 165;
++	case MWX_REG_ID:
++		/* 5150-5350 and 5725-5825 MHz: 165 (5815-5835) would cross 5825 */
++		return ch >= 149 && ch <= 161;
+ 	default:
+ 		return 0;
+ 	}
+@@ -2523,9 +2528,16 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
+ 	MWX_DEV_LOG(sc, "attach interrupt mapped source=%s\n",
+ 	    pci_intr_string(pa->pa_pc, ih));
+ 
+-	if (mwx_mcu_fw_pmctrl(sc) != 0 ||
+-	    mwx_mcu_drv_pmctrl(sc) != 0) {
+-		MWX_DEV_LOG(sc, "attach MCU power control failed\n");
++	/*
++	 * Local patch: always run both steps. If the hand-over to the firmware
++	 * times out, the driver must still take ownership back before the WFSYS
++	 * reset (this is what the binary-patched 0.7.2 did).
++	 */
++	int yy_fwerr = mwx_mcu_fw_pmctrl(sc);
++	int yy_drverr = mwx_mcu_drv_pmctrl(sc);
++	if (yy_fwerr != 0 || yy_drverr != 0) {
++		MWX_DEV_LOG(sc, "attach MCU power control failed (fw_own=%d drv_own=%d)\n",
++		    yy_fwerr, yy_drverr);
+ 		{
+ 			uint32_t o[] = { 0x0, 0x4, 0x10194, 0xd4200, 0xd4208, 0xe0010, 0xe00f0 };
+ 			unsigned k;
+@@ -2538,9 +2550,16 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
+ 			    mwx_read(sc, MT_WFSYS_SW_RST_B), mwx_read(sc, MT_TOP_LPCR_HOST_BAND0),
+ 			    mwx_read(sc, MT_CONN_ON_MISC));
+ 		}
+-		goto fail;
++		/*
++		 * Local patch: after a warm restart the card keeps power and its
++		 * old state, so the ownership handshake can time out. Do not give
++		 * up here: the WFSYS reset below brings the Wi-Fi block back to a
++		 * known state (the binary-patched 0.7.2 confirmed this works).
++		 */
++		MWX_DEV_LOG(sc, "attach MCU power control failed; continuing to WFSYS reset\n");
++	} else {
++		MWX_DEV_LOG(sc, "attach MCU power control ok\n");
+ 	}
+-	MWX_DEV_LOG(sc, "attach MCU power control ok\n");
+ 
+ 	hwid = mwx_read(sc, MT_HW_CHIPID) & 0xffff;
+ 	hwrev = mwx_read(sc, MT_HW_REV) & 0xff;
+diff --git a/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_input.c b/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_input.c
+index 0963a8b..217651b 100644
+--- a/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_input.c
++++ b/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_input.c
+@@ -2700,11 +2700,11 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
+     }
+     
+     if (status != IEEE80211_STATUS_SUCCESS) {
+-        if (ifp->if_flags & IFF_DEBUG)
+-            XYLog("%s: %sassociation failed (status %d)"
+-                  " for %s\n", ifp->if_xname,
+-                  reassoc ?  "re" : "",
+-                  status, ether_sprintf((u_int8_t *)wh->i_addr3));
++        /* Local patch: always log the AP's refusal code (hotspot debugging). */
++        XYLog("%s: %sassociation REFUSED by AP (status %d, capinfo 0x%04x)"
++              " for %s\n", ifp->if_xname,
++              reassoc ?  "re" : "",
++              status, capinfo, ether_sprintf((u_int8_t *)wh->i_addr3));
+         if (ni != ic->ic_bss)
+             ni->ni_fails++;
+         ic->ic_stats.is_rx_auth_fail++;
+@@ -2777,15 +2777,35 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
+     }
+     /* supported rates element is mandatory */
+     if (rates == NULL || rates[1] > IEEE80211_RATE_MAXSIZE) {
+-        DPRINTF(("invalid supported rates element\n"));
++        /* Local patch: always log (hotspot debugging). */
++        XYLog("%s: assoc resp DROPPED: invalid supported rates element (%s, len %d) from %s\n",
++              ifp->if_xname, rates == NULL ? "missing" : "too long",
++              rates == NULL ? -1 : (int)rates[1], ether_sprintf((u_int8_t *)wh->i_addr2));
+         return;
+     }
++    {
++        /* Local patch: log the AP's rate sets before negotiation. */
++        char rb[3 * 2 * IEEE80211_RATE_MAXSIZE + 8];
++        int k, o = 0;
++        for (k = 0; k < rates[1] && o < (int)sizeof(rb) - 4; k++)
++            o += snprintf(rb + o, sizeof(rb) - o, "%02x ", rates[2 + k]);
++        if (xrates != NULL) {
++            o += snprintf(rb + o, sizeof(rb) - o, "| ");
++            for (k = 0; k < xrates[1] && o < (int)sizeof(rb) - 4; k++)
++                o += snprintf(rb + o, sizeof(rb) - o, "%02x ", xrates[2 + k]);
++        }
++        XYLog("%s: assoc resp aid=0x%04x capinfo=0x%04x rates=%s ht=%d vht=%d he=%d wmm=%d\n",
++              ifp->if_xname, associd, capinfo, rb, htcaps != NULL, vhtcap != NULL,
++              hecap != NULL, wmmie != NULL || edcaie != NULL);
++    }
+     rate = ieee80211_setup_rates(ic, ni, rates, xrates,
+                                  IEEE80211_F_DOSORT | IEEE80211_F_DOFRATE | IEEE80211_F_DONEGO |
+                                  IEEE80211_F_DODEL);
+     if (rate & IEEE80211_RATE_BASIC) {
+-        DPRINTF(("rate mismatch for %s\n",
+-                 ether_sprintf((u_int8_t *)wh->i_addr2)));
++        /* Local patch: always log (hotspot debugging). */
++        XYLog("%s: assoc resp DROPPED: basic rate mismatch (rate 0x%02x, curmode %d) for %s\n",
++              ifp->if_xname, rate, (int)ic->ic_curmode,
++              ether_sprintf((u_int8_t *)wh->i_addr2));
+         ic->ic_stats.is_rx_assoc_norate++;
+         return;
+     }
+diff --git a/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_output.c b/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_output.c
+index eb5dcc4..2d10a60 100644
+--- a/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_output.c
++++ b/Source/YYavicMtkWlan/mtk80211/openbsd/net80211/ieee80211_output.c
+@@ -1092,8 +1092,13 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
+         return frm;
+ 
+     /* write RSN Capabilities field */
+-    rsncaps = (ni->ni_rsncaps & (IEEE80211_RSNCAP_PTKSA_RCNT_MASK |
+-        IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
++    /*
++     * Local patch: OpenBSD echoes the AP's PTKSA/GTKSA replay counter counts.
++     * The Windows Mobile Hotspot (RSN caps 0x3c, 16/16 counters) refuses that
++     * with status 45 (invalid RSN capabilities). As a station advertise the
++     * default single counters (0), as wpa_supplicant and Apple do.
++     */
++    rsncaps = 0;
+     if (ic->ic_caps & IEEE80211_C_MFP) {
+         rsncaps |= IEEE80211_RSNCAP_MFPC;
+         if (ic->ic_flags & IEEE80211_F_MFPR)
+@@ -1626,6 +1631,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
+ 		frm = ieee80211_add_xrates(frm, rs);
+ 	if ((ic->ic_flags & IEEE80211_F_RSNON) &&
+ 		(ni->ni_rsnprotos & IEEE80211_PROTO_RSN)) {
++		u_int8_t *rsnie = frm;
+ #ifdef USE_APPLE_SUPPLICANT
+ 		if (ic->ic_rsn_ie_override[1] > 0) {
+ 			memcpy(frm, ic->ic_rsn_ie_override, 2 + ic->ic_rsn_ie_override[1]);
+@@ -1634,6 +1640,15 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
+ 		else
+ #endif
+ 		frm = ieee80211_add_rsn(frm, ic, ni);
++		{
++			/* Local patch: log the RSN element we send (hotspot debugging). */
++			char hb[3 * 64 + 4];
++			int k, o = 0, n = (int)(frm - rsnie);
++			for (k = 0; k < n && k < 64; k++)
++				o += snprintf(hb + o, sizeof(hb) - o, "%02x ", rsnie[k]);
++			XYLog("assoc req RSN IE (%d bytes, AP caps 0x%04x): %s\n", n,
++			    ni->ni_rsncaps, hb);
++		}
+ 	}
+ 	if (ni->ni_flags & IEEE80211_NODE_QOS)
+ 		frm = ieee80211_add_qos_capability(frm, ic);
